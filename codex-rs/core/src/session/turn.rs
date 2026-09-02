@@ -2237,6 +2237,23 @@ async fn try_run_sampling_request(
         .last()
         .map(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
         .unwrap_or(false);
+    let prompt_last_item_type = prompt
+        .input
+        .last()
+        .map(|item| match item {
+            ResponseItem::FunctionCallOutput { .. } => "FunctionCallOutput",
+            ResponseItem::FunctionCall { .. } => "FunctionCall",
+            ResponseItem::Message { role, .. } => "Message",
+            ResponseItem::Reasoning { .. } => "Reasoning",
+            _ => "Other",
+        })
+        .unwrap_or("empty");
+    info!(
+        prompt_len = prompt.input.len(),
+        prompt_ends_with_tool_output,
+        prompt_last_item_type,
+        "try_run_sampling_request: prompt state"
+    );
     let mut tool_calls_this_request: u32 = 0;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
