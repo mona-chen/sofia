@@ -2232,11 +2232,45 @@ async fn try_run_sampling_request(
     // working instead of producing a text summary mid-task.
     const MAX_TOOL_RESULT_CONTINUE: u32 = 3;
     let mut tool_result_continue_count: u32 = 0;
-    let prompt_ends_with_tool_output = prompt
-        .input
-        .last()
-        .map(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
-        .unwrap_or(false);
+    // Detect unresolved tool results: is there a FunctionCallOutput in the
+    // prompt that was NOT followed by a FunctionCall (i.e. the model received
+    // tool results but didn't call any tools)? This handles the common case
+    // where the user types "continue" after the model stopped mid-task:
+    //
+    //   [FunctionCallOutput]  ← tool results
+    //   [Message: assistant]  ← text summary, no tool calls
+    //   [Message: user]       ← "continue"
+    //
+    // The old check looked at the LAST item (user message), missing this pattern.
+    let has_unresolved_tool_results = {
+        let mut last_was_function_call_output = false;
+        let mut has_trailing_tool_output = false;
+        for item in &prompt.input {
+            match item {
+                ResponseItem::FunctionCallOutput { .. } => {
+                    last_was_function_call_output = true;
+                }
+                ResponseItem::FunctionCall { .. } => {
+                    // A FunctionCall "consumes" the preceding FunctionCallOutput.
+                    last_was_function_call_output = false;
+                }
+                _ => {
+                    // Any non-tool item after FunctionCallOutput means
+                    // the model didn't respond with a tool call.
+                    if last_was_function_call_output {
+                        has_trailing_tool_output = true;
+                    }
+                    last_was_function_call_output = false;
+                }
+            }
+        }
+        // Also catch the case where the prompt ends with FunctionCallOutput
+        // (tool results delivered, model hasn't responded yet).
+        if last_was_function_call_output {
+            has_trailing_tool_output = true;
+        }
+        has_trailing_tool_output
+    };
     let prompt_last_item_type = prompt
         .input
         .last()
@@ -2250,7 +2284,7 @@ async fn try_run_sampling_request(
         .unwrap_or("empty");
     info!(
         prompt_len = prompt.input.len(),
-        prompt_ends_with_tool_output,
+        has_unresolved_tool_results,
         prompt_last_item_type,
         "try_run_sampling_request: prompt state"
     );
@@ -2613,7 +2647,7 @@ async fn try_run_sampling_request(
                 // instead of acting. Bounded by MAX_TOOL_RESULT_CONTINUE.
                 if !needs_follow_up
                     && tool_calls_this_request == 0
-                    && prompt_ends_with_tool_output
+                    && has_unresolved_tool_results
                     && tool_result_continue_count < MAX_TOOL_RESULT_CONTINUE
                 {
                     tool_result_continue_count += 1;
