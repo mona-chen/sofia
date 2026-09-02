@@ -666,6 +666,35 @@ pub(crate) fn construct_model_info_from_candidates(
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
     let model_info = if let Some(remote) = remote {
+        // Non-OpenAI models (e.g. MiMo, Groq, etc.) often have empty
+        // instructions_template in the models.dev cache. Without a base
+        // instruction the model has no behavioral foundation — it won't
+        // chain tools, will narrate plans, and stops mid-task. Backfill
+        // with the local BASE_INSTRUCTIONS so every model gets at least
+        // the Sofia personality and tool-use guidelines.
+        let mut remote = remote;
+        if let Some(ref mut messages) = remote.model_messages {
+            if messages
+                .instructions_template
+                .as_ref()
+                .is_none_or(|t| t.is_empty())
+            {
+                messages.instructions_template =
+                    Some(model_info::BASE_INSTRUCTIONS.to_string());
+            }
+        } else {
+            remote.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+                instructions_template: Some(model_info::BASE_INSTRUCTIONS.to_string()),
+                instructions_variables: None,
+                approvals: None,
+                collaboration_modes: None,
+                auto_review: None,
+                permissions: None,
+                multi_agent: None,
+                token_budget: None,
+                guardian_v2: None,
+            });
+        }
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
