@@ -351,6 +351,15 @@ pub struct TruncationPolicyConfig {
     pub limit: i64,
 }
 
+impl Default for TruncationPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: TruncationMode::Tokens,
+            limit: 1024,
+        }
+    }
+}
+
 impl TruncationPolicyConfig {
     pub const fn bytes(limit: i64) -> Self {
         Self {
@@ -384,18 +393,37 @@ const fn is_true(value: &bool) -> bool {
     *value
 }
 
+fn default_shell_type() -> ConfigShellToolType {
+    ConfigShellToolType::UnifiedExec
+}
+
+fn default_visibility() -> ModelVisibility {
+    ModelVisibility::List
+}
+
+fn default_truncation_policy() -> TruncationPolicyConfig {
+    TruncationPolicyConfig::default()
+}
+
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
+    #[serde(alias = "id")]
     pub slug: String,
+    #[serde(default)]
     pub display_name: String,
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<ReasoningEffort>,
+    #[serde(default)]
     pub supported_reasoning_levels: Vec<ReasoningEffortPreset>,
+    #[serde(default = "default_shell_type")]
     pub shell_type: ConfigShellToolType,
+    #[serde(default = "default_visibility")]
     pub visibility: ModelVisibility,
+    #[serde(default)]
     pub supported_in_api: bool,
+    #[serde(default)]
     pub priority: i32,
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
@@ -418,11 +446,13 @@ pub struct ModelInfo {
     pub supports_reasoning_summary_parameter: bool,
     #[serde(default)]
     pub default_reasoning_summary: ReasoningSummary,
+    #[serde(default)]
     pub support_verbosity: bool,
     pub default_verbosity: Option<Verbosity>,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     #[serde(default)]
     pub web_search_tool_type: WebSearchToolType,
+    #[serde(default = "default_truncation_policy")]
     pub truncation_policy: TruncationPolicyConfig,
     #[serde(default)]
     pub supports_image_detail_original: bool,
@@ -443,6 +473,7 @@ pub struct ModelInfo {
     /// reserving headroom for system prompts, tool overhead, and model output.
     #[serde(default = "default_effective_context_window_percent")]
     pub effective_context_window_percent: i64,
+    #[serde(default)]
     pub experimental_supported_tools: Vec<String>,
     /// Input modalities accepted by the backend for this model.
     #[serde(default = "default_input_modalities")]
@@ -692,6 +723,7 @@ impl From<&ModelUpgrade> for ModelInfoUpgrade {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema, Default)]
 pub struct ModelsResponse {
     #[serde(
+        alias = "data",
         serialize_with = "serialize_model_infos_with_legacy_base",
         deserialize_with = "deserialize_model_infos_with_legacy_base"
     )]
@@ -776,11 +808,21 @@ where
                 .and_then(|messages| messages.instructions_template.as_ref())
                 .is_none()
             {
-                let model_slug = &model.slug;
-                return Err(D::Error::custom(format!(
-                    "model `{model_slug}` is missing both `base_instructions` and \
-                     `model_messages.instructions_template`"
-                )));
+                // Models from external providers (e.g., MiMo via /models) may not
+                // include instructions. Allow them through with empty instructions
+                // rather than rejecting them entirely.
+                let messages = model.model_messages.get_or_insert(ModelMessages {
+                    instructions_template: None,
+                    instructions_variables: None,
+                    approvals: None,
+                    collaboration_modes: None,
+                    auto_review: None,
+                    permissions: None,
+                    multi_agent: None,
+                    token_budget: None,
+                    guardian_v2: None,
+                });
+                messages.instructions_template = Some(String::new());
             }
             Ok(model)
         })
@@ -1339,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn models_response_rejects_model_without_instruction_source() {
+    fn models_response_accepts_model_without_instruction_source() {
         let mut value = serde_json::to_value(ModelsResponse {
             models: vec![test_model(/*spec*/ None)],
         })
@@ -1350,14 +1392,16 @@ mod tests {
             .remove("base_instructions")
             .expect("serialized model should include legacy base instructions");
 
-        let error = serde_json::from_value::<ModelsResponse>(value)
-            .expect_err("model without instructions should be rejected");
-
-        assert_eq!(
-            error.to_string(),
-            "model `test-model` is missing both `base_instructions` and \
-             `model_messages.instructions_template`"
+        // External providers (e.g., MiMo) may not include instructions.
+        // The deserializer now accepts them with empty instructions.
+        let result = serde_json::from_value::<ModelsResponse>(value);
+        assert!(
+            result.is_ok(),
+            "model without instructions should be accepted: {:?}",
+            result.err()
         );
+        let model = &result.unwrap().models[0];
+        assert_eq!(model.slug, "test-model");
     }
 
     #[test]

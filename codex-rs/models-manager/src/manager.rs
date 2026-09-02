@@ -377,13 +377,18 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
-        if !self.should_refresh_models().await {
-            if matches!(
-                refresh_strategy,
-                RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
-            ) {
-                self.try_load_cache().await;
-            }
+        // `should_refresh_models` reflects providers that must hit the network
+        // (Codex backend / command-auth). Custom `model_providers` entries (e.g.
+        // a bearer-token provider with its own base_url) also expose a remote
+        // `/models` catalog, so they must not be permanently pinned to the cached
+        // catalog — otherwise switching providers keeps reusing the previous
+        // provider's (or the bundled static) model list and custom models like
+        // `mimo-v2.5` never resolve.
+        if !self.should_refresh_models().await
+            && matches!(refresh_strategy, RefreshStrategy::Offline)
+        {
+            // Offline never fetches; only load from cache.
+            self.try_load_cache().await;
             return Ok(());
         }
 

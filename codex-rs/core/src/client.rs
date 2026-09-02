@@ -75,10 +75,12 @@ use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
 
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -106,6 +108,8 @@ use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
+use tracing::debug;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
@@ -121,6 +125,7 @@ use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_http_client::HttpTransport;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
@@ -134,7 +139,9 @@ use codex_model_provider_info::DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
+use codex_protocol::error::UnexpectedResponseError;
 use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::extract_response_debug_context_from_api_error;
 use codex_response_debug_context::telemetry_api_error_message;
@@ -160,6 +167,7 @@ const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
     "x-openai-internal-codex-responses-lite";
 const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
 const RESPONSES_ENDPOINT: &str = "/responses";
+const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
 // period between stream events.
@@ -1930,7 +1938,509 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::ChatCompletions => {
+                // Chat Completions adapter — sends requests to the provider's
+                // /v1/chat/completions endpoint using the Chat Completions wire format.
+                // This is the path for MiMo, OpenRouter, Groq, and other OpenAI-compatible
+                // providers.
+                self.stream_chat_completions_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
         }
+    }
+
+    /// Streams a turn via the Chat Completions API (`/v1/chat/completions`).
+    ///
+    /// This path is used for providers configured with `wire_api = "chat"` or
+    /// `wire_api = "chat_completions"` (MiMo, OpenRouter, Groq, and any other
+    /// OpenAI-compatible provider). The request is translated from the internal
+    /// prompt format to the Chat Completions wire format, and the streaming
+    /// response is translated back to the internal event stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        _session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        _summary: ReasoningSummaryConfig,
+        _service_tier: Option<String>,
+        _responses_metadata: &CodexResponsesMetadata,
+        _inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        info!(
+            model = %model_info.slug,
+            effort = ?effort,
+            tool_count = prompt.tools.len(),
+            input_items = prompt.input.len(),
+            "stream_chat_completions_api: starting turn"
+        );
+
+        // Build the Chat Completions request body from the internal prompt format.
+        let request_body = build_chat_completions_body(prompt, model_info, &effort)?;
+        debug!(
+            body_size = serde_json::to_string(&request_body).map(|s| s.len()).unwrap_or(0),
+            "stream_chat_completions_api: request body built"
+        );
+
+        // Retry loop — retry on transient transport/HTTP errors (network failures,
+        // 429 rate-limited, 500/502/503 server errors) with exponential backoff.
+        let max_retries = 3u32;
+        let mut last_error: Option<CodexErr> = None;
+        let stream_response = 'retry: {
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    info!(
+                        attempt,
+                        max_retries,
+                        "stream_chat_completions_api: retrying after previous failure"
+                    );
+                }
+                let client_setup = self.client.current_client_setup().await?;
+                let transport = self
+                    .client
+                    .build_api_transport(&client_setup.api_provider, CHAT_COMPLETIONS_ENDPOINT)?;
+
+                // Build the HTTP request.
+                let mut request = client_setup
+                    .api_provider
+                    .build_request(http::Method::POST, CHAT_COMPLETIONS_ENDPOINT);
+                client_setup.api_auth.add_auth_headers(&mut request.headers);
+                request.body = Some(codex_http_client::RequestBody::Json(request_body.clone()));
+
+                debug!(attempt, "stream_chat_completions_api: sending request");
+                match transport.stream(request).await {
+                    Ok(resp) if resp.status.is_success() => {
+                        info!(status = %resp.status, attempt, "stream_chat_completions_api: streaming started");
+                        break 'retry resp;
+                    }
+                    Ok(resp) => {
+                        // HTTP error — read the body and decide if retryable.
+                        let status = resp.status;
+                        let mut body = Vec::new();
+                        {
+                            use futures::StreamExt;
+                            let mut byte_stream = resp.bytes;
+                            while let Some(chunk) = byte_stream.next().await {
+                                if let Ok(bytes) = chunk {
+                                    body.extend_from_slice(&bytes);
+                                }
+                            }
+                        }
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+                        let retryable = status.is_server_error()
+                            || status == http::StatusCode::TOO_MANY_REQUESTS
+                            || status == http::StatusCode::REQUEST_TIMEOUT;
+                        warn!(
+                            status = %status,
+                            attempt,
+                            retryable,
+                            body_len = body_str.len(),
+                            "stream_chat_completions_api: HTTP error"
+                        );
+                        if retryable && attempt < max_retries {
+                            let delay_ms = 500 * 2u64.pow(attempt);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            last_error = Some(CodexErr::from(CodexErrorDetails::UnexpectedStatus(
+                                UnexpectedResponseError {
+                                    status,
+                                    body: body_str,
+                                    user_message: None,
+                                    url: None,
+                                    cf_ray: None,
+                                    request_id: None,
+                                    identity_error_code: None,
+                                    identity_authorization_error: None,
+                                },
+                            )));
+                            continue;
+                        }
+                        return Err(CodexErr::from(CodexErrorDetails::UnexpectedStatus(
+                            UnexpectedResponseError {
+                                status,
+                                body: body_str,
+                                user_message: None,
+                                url: None,
+                                cf_ray: None,
+                                request_id: None,
+                                identity_error_code: None,
+                                identity_authorization_error: None,
+                            },
+                        )));
+                    }
+                    Err(e) => {
+                        // Transport-level error (DNS, connection refused, timeout).
+                        warn!(
+                            error = %e,
+                            attempt,
+                            "stream_chat_completions_api: transport error"
+                        );
+                        if attempt < max_retries {
+                            let delay_ms = 500 * 2u64.pow(attempt);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            last_error = Some(CodexErr::from(CodexErrorDetails::Stream(
+                                format!("chat completions request failed (attempt {}): {e}", attempt + 1),
+                            )));
+                            continue;
+                        }
+                        return Err(CodexErr::from(CodexErrorDetails::Stream(format!(
+                            "chat completions request failed after {} retries: {e}",
+                            max_retries
+                        ))));
+                    }
+                }
+            }
+            warn!(
+                max_retries,
+                "stream_chat_completions_api: all retries exhausted"
+            );
+            return Err(last_error.unwrap_or_else(|| {
+                CodexErr::from(CodexErrorDetails::Stream(
+                    "chat completions request failed".to_string(),
+                ))
+            }));
+        };
+
+        // Parse the SSE response stream into ResponseEvents.
+        let inference_attempt = _inference_trace.start_attempt();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let response_id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        tokio::spawn(async move {
+            use codex_api::ResponseEvent;
+
+            let mut byte_stream = stream_response.bytes;
+            let mut line_buf = Vec::new();
+            let mut text_content = String::new();
+            let mut reasoning_started = false;
+            let mut reasoning_item_id: Option<ResponseItemId> = None;
+            let mut reasoning_text = String::new();
+            let mut finish_reason: Option<String> = None;
+            let mut token_usage: Option<codex_protocol::protocol::TokenUsage> = None;
+            // BTreeMap preserves tool call index ordering (HashMap is non-deterministic).
+            let mut tool_call_buffers: std::collections::BTreeMap<u64, (String, String, String)> =
+                std::collections::BTreeMap::new();
+
+            info!(response_id = %response_id, "stream_chat_completions_api: SSE parse task started");
+            let _ = tx.send(Ok(ResponseEvent::Created)).await;
+
+            let mut chunk_count: u64 = 0;
+            let mut text_delta_count: u64 = 0;
+            let mut reasoning_delta_count: u64 = 0;
+            let mut tool_call_index_count: u64 = 0;
+
+            // Read chunks from the SSE stream incrementally, split into lines,
+            // and process each complete line immediately.
+            let mut stream_ended = false;
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                chunk_count += 1;
+                line_buf.extend_from_slice(&chunk);
+
+                // Process all complete \n-terminated lines in the buffer.
+                while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = line_buf.drain(..=newline_pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let line = line.trim();
+
+                    if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
+
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        continue;
+                    };
+                    if data == "[DONE]" {
+                        info!(
+                            response_id = %response_id,
+                            chunk_count,
+                            text_delta_count,
+                            reasoning_delta_count,
+                            tool_call_index_count,
+                            "stream_chat_completions_api: [DONE] received"
+                        );
+                        stream_ended = true;
+                        break;
+                    }
+
+                    let parsed: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
+                        for choice in choices {
+                            if let Some(delta) = choice.get("delta") {
+                                // Text content.
+                                if let Some(text) =
+                                    delta.get("content").and_then(|c| c.as_str())
+                                {
+                                    if !text.is_empty() {
+                                        text_content.push_str(text);
+                                        text_delta_count += 1;
+                                        let _ = tx
+                                            .send(Ok(ResponseEvent::OutputTextDelta(
+                                                text.to_string(),
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                // Reasoning content.
+                                if let Some(reasoning) = delta
+                                    .get("reasoning_content")
+                                    .or_else(|| delta.get("reasoning"))
+                                    .and_then(|r| r.as_str())
+                                {
+                                    if !reasoning.is_empty() {
+                                        if !reasoning_started {
+                                            reasoning_started = true;
+                                            let rid =
+                                                ResponseItemId::new("reasoning");
+                                            reasoning_item_id = Some(rid.clone());
+                                            let _ = tx
+                                                .send(Ok(ResponseEvent::OutputItemAdded(
+                                                    ResponseItem::Reasoning {
+                                                        id: Some(rid),
+                                                        summary: vec![],
+                                                        content: Some(vec![]),
+                                                        encrypted_content: None,
+                                                        internal_chat_message_metadata_passthrough:
+                                                            None,
+                                                    },
+                                                )))
+                                                .await;
+                                        }
+                                        reasoning_text.push_str(reasoning);
+                                        reasoning_delta_count += 1;
+                                        let _ = tx
+                                            .send(Ok(ResponseEvent::ReasoningContentDelta {
+                                                delta: reasoning.to_string(),
+                                                content_index: 0,
+                                            }))
+                                            .await;
+                                    }
+                                }
+                                // Tool call deltas — Chat Completions streams tool
+                                // arguments incrementally. We emit OutputItemAdded as
+                                // soon as the tool name arrives so the TUI shows the
+                                // tool call cell immediately, then accumulate arguments
+                                // and finalize in OutputItemDone at the end.
+                                if let Some(tool_calls) =
+                                    delta.get("tool_calls").and_then(|t| t.as_array())
+                                {
+                                    for tc in tool_calls {
+                                        let index = tc
+                                            .get("index")
+                                            .and_then(|i| i.as_u64())
+                                            .unwrap_or(0);
+                                        let entry = tool_call_buffers
+                                            .entry(index)
+                                            .or_insert_with(|| {
+                                                (
+                                                    format!("{response_id}_tc_{index}"),
+                                                    String::new(),
+                                                    String::new(),
+                                                )
+                                            });
+                                        if let Some(name) = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|n| n.as_str())
+                                        {
+                                            if !name.is_empty() && entry.1.is_empty() {
+                                                // First time we see the name — emit
+                                                // OutputItemAdded so the TUI shows the
+                                                // tool call cell right away.
+                                                tool_call_index_count += 1;
+                                                debug!(name = %name, index, "stream_chat_completions_api: tool call started");
+                                                entry.1 = name.to_string();
+                                                let _ = tx
+                                                    .send(Ok(ResponseEvent::OutputItemAdded(
+                                                        ResponseItem::FunctionCall {
+                                                            id: None,
+                                                            name: name.to_string(),
+                                                            namespace: None,
+                                                            arguments: String::new(),
+                                                            encrypted_function_args: None,
+                                                            call_id: entry.0.clone(),
+                                                            internal_chat_message_metadata_passthrough: None,
+                                                        },
+                                                    )))
+                                                    .await;
+                                            }
+                                        }
+                                        if let Some(args) = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("arguments"))
+                                            .and_then(|a| a.as_str())
+                                        {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+                            // Track finish_reason from the response.
+                            if let Some(fr) =
+                                choice.get("finish_reason").and_then(|r| r.as_str())
+                            {
+                                if !fr.is_empty() {
+                                    info!(finish_reason = %fr, "stream_chat_completions_api: finish_reason received");
+                                    finish_reason = Some(fr.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    // Parse token usage from the final chunk (when
+                    // stream_options.include_usage is set, the last SSE
+                    // payload contains a `usage` object).
+                    if let Some(usage_obj) = parsed.get("usage").and_then(|u| u.as_object()) {
+                        let input_tokens = usage_obj
+                            .get("prompt_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            as i64;
+                        let output_tokens = usage_obj
+                            .get("completion_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            as i64;
+                        let total_tokens = usage_obj
+                            .get("total_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or((input_tokens + output_tokens) as u64)
+                            as i64;
+                        token_usage = Some(codex_protocol::protocol::TokenUsage {
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                            ..Default::default()
+                        });
+                    }
+                }
+                if stream_ended {
+                    break;
+                }
+            }
+
+            // Capture lengths before values are moved into events.
+            let reasoning_len = reasoning_text.len();
+            let text_len = text_content.len();
+            let tool_call_count = tool_call_buffers.len();
+
+            // Close the reasoning item if one was opened, preserving
+            // accumulated text so it's persisted in conversation history.
+            if reasoning_started {
+                let content = if reasoning_text.is_empty() {
+                    vec![]
+                } else {
+                    vec![ReasoningItemContent::ReasoningText {
+                        text: reasoning_text,
+                    }]
+                };
+                let _ = tx
+                    .send(Ok(ResponseEvent::OutputItemDone(
+                        ResponseItem::Reasoning {
+                            id: reasoning_item_id,
+                            summary: vec![],
+                            content: Some(content),
+                            encrypted_content: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )))
+                    .await;
+            }
+
+            // Set end_turn based on finish_reason.
+            //
+            // Only set end_turn = false when the model explicitly requests tool
+            // execution via finish_reason == "tool_calls". For "stop" (or any
+            // other/missing reason) always signal end_turn = true — a premature
+            // stop is recoverable by re-prompting, whereas a false-negative
+            // text heuristic that sets end_turn = false causes an infinite loop.
+            let end_turn = match finish_reason.as_deref() {
+                Some("tool_calls") => Some(false),
+                _ => Some(true),
+            };
+
+            // Log the completed turn with all accumulated stats.
+            info!(
+                response_id = %response_id,
+                finish_reason = ?finish_reason,
+                end_turn = ?end_turn,
+                text_len,
+                reasoning_len,
+                tool_calls = tool_call_count,
+                token_usage = ?token_usage,
+                chunk_count,
+                text_delta_count,
+                reasoning_delta_count,
+                tool_call_index_count,
+                "stream_chat_completions_api: turn completed"
+            );
+
+            // Emit OutputItemDone for each tool call. OutputItemAdded was already
+            // emitted during streaming (on the first argument delta) so the turn
+            // loop could set up its diff consumer. Now finalize with the complete
+            // name + accumulated arguments.
+            for (_index, (call_id, name, arguments)) in tool_call_buffers {
+                let _ = tx
+                    .send(Ok(ResponseEvent::OutputItemDone(
+                        ResponseItem::FunctionCall {
+                            id: None,
+                            name,
+                            namespace: None,
+                            arguments,
+                            encrypted_function_args: None,
+                            call_id,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )))
+                    .await;
+            }
+
+            // Emit text message if there's content.
+            if !text_content.is_empty() {
+                let _ = tx
+                    .send(Ok(ResponseEvent::OutputItemDone(
+                        ResponseItem::Message {
+                            id: Some(ResponseItemId::new("msg")),
+                            role: "assistant".to_string(),
+                            content: vec![ContentItem::OutputText { text: text_content }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )))
+                    .await;
+            }
+
+            let _ = tx
+                .send(Ok(ResponseEvent::Completed {
+                    response_id: response_id.clone(),
+                    token_usage: token_usage.clone(),
+                    end_turn,
+                }))
+                .await;
+
+            inference_attempt.record_completed(&response_id, None, &token_usage, &[]);
+        });
+
+        Ok(ResponseStream {
+            rx_event: rx,
+            consumer_dropped: CancellationToken::new(),
+        })
     }
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
@@ -2549,6 +3059,228 @@ impl WebsocketTelemetry for ApiTelemetry {
         self.session_telemetry
             .record_websocket_event(result, duration);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chat Completions adapter helpers
+// ---------------------------------------------------------------------------
+
+/// Strip Responses-API-only fields from a JSON Schema value recursively.
+/// Fields like `encrypted` are only valid in the Responses API and cause
+/// HTTP 400 errors with Chat Completions providers (e.g., MiMo).
+fn strip_responses_only_fields(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            map.remove("encrypted");
+            for v in map.values_mut() {
+                strip_responses_only_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_responses_only_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Tool-use directive appended to the system prompt for Chat Completions
+/// providers. Without this, models like MiMo tend to describe what they
+/// would do instead of actually calling tools, or stop after the first
+/// tool result without continuing the task.
+const TOOL_USE_DIRECTIVE: &str = "You are an autonomous coding agent. You MUST use tool calls to complete tasks — do not just describe what you would do. Rules:
+1. When you receive a tool result, you MUST continue with the next action. Never stop immediately after a tool result.
+2. Never summarize tool results as a text response. Instead, use the information to take the next concrete step.
+3. Only produce a final text response when the task is fully complete and no more actions are needed.
+4. If you are unsure what to do next, take the most obvious next step rather than stopping.";
+
+/// Appended after tool results to prevent the model from stopping mid-task.
+/// This is added when the prompt ends with FunctionCallOutput items, signaling
+/// that tool results were just provided and the model should keep working.
+const TOOL_RESULT_CONTINUE: &str = "The above tool results were just returned. You MUST continue taking the next concrete action now — do NOT stop or summarize.";
+
+/// Build a Chat Completions request body from the internal prompt format.
+fn build_chat_completions_body(
+    prompt: &Prompt,
+    model_info: &ModelInfo,
+    effort: &Option<ReasoningEffortConfig>,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let mut messages = Vec::new();
+
+    // System instructions.
+    let system_text = &prompt.base_instructions.text;
+    let system_content = if system_text.is_empty() {
+        TOOL_USE_DIRECTIVE.to_string()
+    } else {
+        format!("{system_text}
+
+{TOOL_USE_DIRECTIVE}")
+    };
+    messages.push(json!({
+        "role": "system",
+        "content": system_content
+    }));
+
+    // Convert ResponseItem entries to Chat Completions messages.
+    //
+    // The Chat Completions protocol requires that a `role: "tool"` message be
+    // preceded by an `role: "assistant"` message carrying the matching
+    // `tool_calls` array. Reconstruct those assistant tool calls and emit them
+    // immediately before their tool outputs, so multi-step agent turns keep
+    // working end to end.
+    let mut pending_assistant_tool_calls: Vec<serde_json::Value> = Vec::new();
+    for item in &prompt.input {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                // Tool calls buffered before this message should already have
+                // been flushed before their tool outputs; nothing to do here.
+                let text = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ContentItem::OutputText { text } => Some(text.as_str()),
+                        ContentItem::InputText { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    messages.push(json!({
+                        "role": role,
+                        "content": text
+                    }));
+                }
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                // Tool outputs follow these calls; accumulate them so they can be
+                // emitted as an assistant message directly before the results.
+                pending_assistant_tool_calls.push(json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                // The assistant message with all accumulated tool calls must come
+                // before the tool results that reference them.
+                if !pending_assistant_tool_calls.is_empty() {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": std::mem::take(&mut pending_assistant_tool_calls),
+                    }));
+                }
+                let content = output.text_content().unwrap_or("");
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content
+                }));
+            }
+            _ => {}
+        }
+    }
+    // Flush any trailing assistant tool_calls that had no tool outputs following.
+    if !pending_assistant_tool_calls.is_empty() {
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": std::mem::take(&mut pending_assistant_tool_calls),
+        }));
+    }
+
+    // --- State-based continuation prompt ---
+    // If the prompt ends with FunctionCallOutput items (i.e. tool results were
+    // just provided), append a trailing system message telling the model to keep
+    // working. This is NOT a heuristic on text content — it's based on
+    // observable conversation structure (tool results present = task in progress).
+    //
+    // The model will still be free to produce end_turn=true if it genuinely
+    // completed the task, but this gives it a strong signal that stopping here
+    // is wrong.
+    let last_is_tool_output = prompt
+        .input
+        .last()
+        .map(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
+        .unwrap_or(false);
+    if last_is_tool_output {
+        messages.push(json!({
+            "role": "system",
+            "content": TOOL_RESULT_CONTINUE,
+        }));
+    }
+
+    let model_slug = &model_info.slug;
+    let mut request = json!({
+        "model": model_slug,
+        "messages": messages,
+        "stream": true,
+        // Request token usage in the final SSE chunk so budget tracking works.
+        "stream_options": { "include_usage": true },
+        // Set a generous max_tokens default so providers that default to small
+        // values (e.g., 256) don't truncate long agent responses.
+        "max_tokens": 32768,
+    });
+
+    // Reasoning effort.
+    if let Some(effort) = effort {
+        let effort_str = match effort {
+            ReasoningEffortConfig::None => "none",
+            ReasoningEffortConfig::Minimal => "minimal",
+            ReasoningEffortConfig::Low => "low",
+            ReasoningEffortConfig::Medium => "medium",
+            ReasoningEffortConfig::High => "high",
+            ReasoningEffortConfig::XHigh => "high",
+            ReasoningEffortConfig::Max => "max",
+            ReasoningEffortConfig::Ultra => "max",
+            ReasoningEffortConfig::Custom(s) => s.as_str(),
+        };
+        request["reasoning_effort"] = json!(effort_str);
+    }
+
+    // Tools.
+    if !prompt.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = prompt
+            .tools
+            .iter()
+            .filter_map(|tool| match tool {
+                codex_tools::ToolSpec::Function(func) => {
+                    // Serialize parameters then strip Responses-only fields
+                    // (`encrypted`) that non-OpenAI providers reject.
+                    let mut params = serde_json::to_value(&func.parameters).ok()?;
+                    strip_responses_only_fields(&mut params);
+                    Some(json!({
+                        "type": "function",
+                        "function": {
+                            "name": func.name,
+                            "description": func.description,
+                            "parameters": params
+                        }
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+        if !tools.is_empty() {
+            request["tools"] = json!(tools);
+            request["tool_choice"] = json!("auto");
+        }
+    }
+
+    Ok(request)
 }
 
 #[cfg(test)]

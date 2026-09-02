@@ -674,6 +674,220 @@ impl App {
                         .add_error_message(format!("Logout failed: {err}"));
                 }
             },
+            AppEvent::ConnectProvider {
+                provider_id,
+                provider_name,
+                base_url,
+                wire_api,
+            } => {
+                // Always prompt for the API key so users can (re)enter or change
+                // it even for an already-configured provider. Pre-fill the stored
+                // key if present.
+                let config = crate::chatwidget::connect_provider_popup::load_providers_config();
+                let existing_key = config
+                    .providers
+                    .get(&provider_id)
+                    .map(|entry| entry.api_key.clone())
+                    .unwrap_or_default();
+                self.chat_widget.prompt_for_provider_api_key(
+                    provider_id,
+                    provider_name,
+                    base_url,
+                    wire_api,
+                    existing_key,
+                );
+            }
+            AppEvent::SaveProviderApiKey {
+                provider_id,
+                provider_name,
+                base_url,
+                wire_api,
+                api_key,
+            } => {
+                // Save to providers.json config file.
+                let mut config =
+                    crate::chatwidget::connect_provider_popup::load_providers_config();
+                config.providers.insert(
+                    provider_id.clone(),
+                    crate::chatwidget::connect_provider_popup::ProviderConfig {
+                        api_key: api_key.clone(),
+                        base_url: base_url.clone(),
+                        wire_api: wire_api.clone(),
+                        name: provider_name.clone(),
+                    },
+                );
+                if let Err(err) =
+                    crate::chatwidget::connect_provider_popup::save_providers_config(&config)
+                {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to save config: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+
+                // Also write the key to sofia-auth.json so the engine can actually
+                // resolve it at request time (ModelProviderInfo::api_key reads
+                // from this file, never from providers.json).
+                let env_key_name = format!("{}_API_KEY", provider_id.to_uppercase().replace('-', "_"));
+                if let Err(err) =
+                    crate::chatwidget::connect_provider_popup::save_auth_key(&env_key_name, &api_key)
+                {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to save API key: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+
+                self.chat_widget.add_info_message(
+                    format!("API key saved for {provider_name}. Fetching models..."),
+                    None,
+                );
+
+                // Step 3: Fetch models asynchronously (avoids blocking TUI with curl).
+                self.chat_widget
+                    .fetch_models_for_provider(provider_id, provider_name);
+            }
+            AppEvent::ModelsFetched {
+                provider_id,
+                provider_name: _,
+                result,
+            } => {
+                // Step 3b: Async fetch completed — show model picker or error.
+                match result {
+                    Ok(models) => {
+                        self.chat_widget
+                            .show_model_picker(provider_id, models);
+                    }
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Could not fetch models for {provider_id}: {err}"
+                        ));
+                    }
+                }
+            }
+            AppEvent::SelectModel {
+                provider_id,
+                model_id,
+            } => {
+                // Step 5: Show effort picker.
+                self.chat_widget
+                    .open_effort_picker_for_model(provider_id, model_id);
+            }
+            AppEvent::FinalizeProviderSetup {
+                provider_id,
+                model_id,
+                effort,
+            } => {
+                // Save provider + model + effort to config.toml.
+                let config_path = self
+                    .config
+                    .codex_home
+                    .to_path_buf()
+                    .join("config.toml");
+                let config_content =
+                    std::fs::read_to_string(&config_path).unwrap_or_default();
+
+                // Read provider info from providers.json.
+                let prov_config =
+                    crate::chatwidget::connect_provider_popup::load_providers_config();
+                let Some(provider_info) = prov_config.providers.get(&provider_id) else {
+                    self.chat_widget
+                        .add_error_message(format!("No config for provider '{provider_id}'"));
+                    return Ok(AppRunControl::Continue);
+                };
+
+                // Build the corrected config.toml. The engine re-reads this file
+                // on every new session and re-derives `model_provider` from it, so
+                // `model_provider` must be at the top level (not nested inside the
+                // `[model_providers.X]` table) or the engine keeps using its
+                // default provider (e.g. OpenAI).
+                match crate::chatwidget::connect_provider_popup::build_provider_config_toml(
+                    &config_content,
+                    &provider_id,
+                    &model_id,
+                    &effort,
+                    &provider_info,
+                ) {
+                    Ok(serialized) => {
+                        if let Err(err) = std::fs::write(&config_path, &serialized) {
+                            self.chat_widget
+                                .add_error_message(format!("Failed to write config: {err}"));
+                        } else {
+                            self.chat_widget.add_info_message(
+                                format!(
+                                    "Connected! Model: {model_id} ({provider_id}, {effort}). Ready to prompt."
+                                ),
+                                None,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to write config: {err}"));
+                    }
+                }
+                // Add the new model to the catalog so /model shows it.
+                let effort_level = match effort.as_str() {
+                    "low" => codex_protocol::openai_models::ReasoningEffort::Low,
+                    "medium" => codex_protocol::openai_models::ReasoningEffort::Medium,
+                    "high" => codex_protocol::openai_models::ReasoningEffort::High,
+                    "max" => codex_protocol::openai_models::ReasoningEffort::Max,
+                    _ => codex_protocol::openai_models::ReasoningEffort::Medium,
+                };
+                let effort_for_sync = effort_level.clone();
+                let model_slug = format!("{provider_id}/{model_id}");
+                let provider_display = provider_info.name.clone();
+                self.model_catalog.add_model(
+                    codex_protocol::openai_models::ModelPreset {
+                        id: model_slug.clone(),
+                        model: model_slug.clone(),
+                        display_name: model_id.clone(),
+                        description: format!("{provider_display} via {provider_id}"),
+                        model_specialty: None,
+                        default_reasoning_effort: effort_level,
+                        supported_reasoning_efforts: Vec::new(),
+                        supports_personality: false,
+                        additional_speed_tiers: Vec::new(),
+                        service_tiers: Vec::new(),
+                        default_service_tier: None,
+                        is_default: false,
+                        upgrade: None,
+                        show_in_picker: true,
+                        multi_agent_version: None,
+                        availability_nux: None,
+                        supported_in_api: true,
+                        input_modalities: vec![
+                            codex_protocol::openai_models::InputModality::Text,
+                        ],
+                    },
+                );
+
+                // Reload the engine's user config so the newly-written
+                // `model_provider = "{provider_id}"` and the `[model_providers.xiaomi]`
+                // section actually take effect. Without this the engine keeps using
+                // the provider it resolved at startup (e.g. OpenAI). Await this so
+                // the config is reloaded before the new session below starts.
+                if let Err(err) = app_server.reload_user_config().await {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to reload config: {err}"));
+                }
+
+                // Apply the model to the live session.
+                let model_slug = format!("{provider_id}/{model_id}");
+                self.chat_widget.set_model(&model_slug);
+                let _ = self
+                    .sync_active_thread_model_setting(
+                        app_server,
+                        model_slug,
+                        Some(effort_for_sync),
+                    )
+                    .await;
+
+                // Dismiss all popups, then restart the session so the new
+                // provider takes effect. The provider is fixed at session start.
+                self.chat_widget.dismiss_all_views();
+                self.app_event_tx.send(AppEvent::NewSession {
+                    name: None,
+                });
+            }
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }

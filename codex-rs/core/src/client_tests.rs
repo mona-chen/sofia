@@ -1043,3 +1043,175 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn chat_completions_body_reconstructs_assistant_tool_calls_before_tool_outputs() {
+    use crate::client::build_chat_completions_body;
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let prompt = Prompt {
+        input: vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Do the task".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some(ResponseItemId::new("fc1")),
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"ls"}"#.to_string(),
+                encrypted_function_args: None,
+                call_id: "call_1".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: Some(ResponseItemId::new("fco1")),
+                call_id: Some("call_1".to_string()),
+                name: Some("shell".to_string()),
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("done".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Finished".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        base_instructions: BaseInstructions {
+            text: "You are a coding agent.".to_string(),
+            provenance: None,
+        },
+        ..Default::default()
+    };
+    let body = build_chat_completions_body(
+        &prompt,
+        &test_model_info(),
+        &Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+    )
+    .unwrap();
+    let messages = body["messages"].as_array().unwrap();
+
+    // 0: system, 1: user, 2: assistant with tool_calls, 3: tool result, 4: assistant final.
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "shell");
+    // The tool result must appear AFTER the assistant tool_calls message that
+    // references it.
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call_1");
+    assert_eq!(messages[4]["role"], "assistant");
+    assert_eq!(messages[4]["content"], "Finished");
+}
+
+#[test]
+fn chat_completions_body_multi_iteration_reproduces_400() {
+    use crate::client::build_chat_completions_body;
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    // Reconstruct a multi-iteration agent conversation: the model calls a tool,
+    // gets a result, thinks (Reasoning), then keeps going — the shape that
+    // trips non-OpenAI providers.
+    let prompt = Prompt {
+        input: vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "ls the repo".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Reasoning {
+                id: Some(ResponseItemId::new("rs1")),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some(ResponseItemId::new("fc1")),
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: "{\"cmd\":\"ls\"}".to_string(),
+                encrypted_function_args: None,
+                call_id: "call_1".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: Some(ResponseItemId::new("fco1")),
+                call_id: Some("call_1".to_string()),
+                name: Some("shell".to_string()),
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("src\nlib\nCargo.toml".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Here are the files.".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Reasoning {
+                id: Some(ResponseItemId::new("rs2")),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some(ResponseItemId::new("fc2")),
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: "{\"cmd\":\"cat Cargo.toml\"}".to_string(),
+                encrypted_function_args: None,
+                call_id: "call_2".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: Some(ResponseItemId::new("fco2")),
+                call_id: Some("call_2".to_string()),
+                name: Some("shell".to_string()),
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("[package]".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        base_instructions: BaseInstructions {
+            text: "You are a coding agent.".to_string(),
+            provenance: None,
+        },
+        ..Default::default()
+    };
+    let body = build_chat_completions_body(
+        &prompt,
+        &test_model_info(),
+        &Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+    )
+    .unwrap();
+    println!("REPRO_BODY={}", serde_json::to_string(&body).unwrap());
+    let messages = body["messages"].as_array().unwrap();
+    assert!(
+        messages.len() >= 6,
+        "unexpected message count: {}",
+        messages.len()
+    );
+}

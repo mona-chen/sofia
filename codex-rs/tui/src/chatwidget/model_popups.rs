@@ -195,37 +195,89 @@ impl ChatWidget {
             return;
         }
 
-        let mut items: Vec<SelectionItem> = Vec::new();
-        for preset in presets.into_iter() {
-            let description =
-                (!preset.description.is_empty()).then_some(preset.description.to_string());
-            let is_current = preset.model.as_str() == self.current_model();
-            let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
-            let preset_for_action = preset.clone();
-            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                let preset_for_event = preset_for_action.clone();
-                tx.send(AppEvent::OpenReasoningPopup {
-                    model: preset_for_event,
-                });
-            })];
-            items.push(SelectionItem {
-                name: preset.model.clone(),
-                description,
-                is_current,
-                is_default: preset.is_default,
-                actions,
-                dismiss_on_select: single_supported_effort,
-                dismiss_parent_on_child_accept: !single_supported_effort,
-                ..Default::default()
-            });
+        let current_model = self.current_model();
+
+        // Group models by provider so each section reads as a labeled group.
+        // Fall back to a Built-in label for unprefixed (OpenAI) models so the
+        // picker always shows section headers instead of a flat, cramped list.
+        let mut grouped: std::collections::BTreeMap<String, Vec<ModelPreset>> =
+            std::collections::BTreeMap::new();
+        for preset in presets {
+            if preset.model.contains('/') {
+                let provider = preset
+                    .model
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                grouped.entry(provider).or_default().push(preset);
+            } else {
+                grouped
+                    .entry("Built-in".to_string())
+                    .or_default()
+                    .push(preset);
+            }
         }
 
-        let header = self.model_menu_header(
-            "Select Model and Effort",
-            "Access legacy models by running codex -m <model_name> or in your config.toml",
-        );
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for (provider, mut models) in grouped {
+            // Current model first within its section, then by name.
+            models.sort_by(|a, b| {
+                let a_current = a.model.as_str() == current_model;
+                let b_current = b.model.as_str() == current_model;
+                b_current
+                    .cmp(&a_current)
+                    .then_with(|| a.model.cmp(&b.model))
+            });
+
+            items.push(SelectionItem {
+                name: String::new(),
+                description: None,
+                name_prefix_spans: vec![ratatui::text::Span::styled(
+                    format!("{} {}", provider, "·".dim()),
+                    ratatui::style::Style::default().dim(),
+                )],
+                is_disabled: true,
+                disabled_gutter_marker: Some(""),
+                ..Default::default()
+            });
+
+            for preset in models {
+                let display_name = if preset.display_name.is_empty() {
+                    preset.model.clone()
+                } else {
+                    preset.display_name.clone()
+                };
+                let description =
+                    (!preset.description.is_empty()).then_some(preset.description.clone());
+                let is_current = preset.model.as_str() == current_model;
+                let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
+                let preset_for_action = preset.clone();
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    let preset_for_event = preset_for_action.clone();
+                    tx.send(AppEvent::OpenReasoningPopup {
+                        model: preset_for_event,
+                    });
+                })];
+                items.push(SelectionItem {
+                    name: display_name,
+                    description,
+                    search_value: Some(preset.model.clone()),
+                    is_current,
+                    is_default: preset.is_default,
+                    actions,
+                    dismiss_on_select: single_supported_effort,
+                    dismiss_parent_on_child_accept: !single_supported_effort,
+                    ..Default::default()
+                });
+            }
+        }
+
+        let header = self.model_menu_header("Select model", "Browse by provider. Type to search.");
         self.bottom_pane.show_selection_view(SelectionViewParams {
             footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
+            is_searchable: true,
+            search_placeholder: Some("Search".to_string()),
             items,
             header,
             ..Default::default()

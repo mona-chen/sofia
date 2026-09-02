@@ -385,6 +385,7 @@ use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
+pub(crate) mod connect_provider_popup;
 mod model_popups;
 mod notifications;
 use self::notifications::Notification;
@@ -998,6 +999,11 @@ impl ChatWidget {
         );
         self.bottom_pane.show_view(Box::new(view));
         self.request_redraw();
+    }
+
+    /// Dismiss all active views (popups, prompts) and return to the composer.
+    pub(crate) fn dismiss_all_views(&mut self) {
+        self.bottom_pane.dismiss_all_views();
     }
 
     pub(crate) fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) {

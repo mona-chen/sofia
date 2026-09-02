@@ -1438,6 +1438,12 @@ impl BottomPane {
         self.can_launch_external_editor()
     }
 
+    /// Dismiss all active views (pop the entire view stack).
+    pub(crate) fn dismiss_all_views(&mut self) {
+        while self.view_stack.pop().is_some() {}
+        self.on_view_stack_depth_decreased();
+    }
+
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
     }

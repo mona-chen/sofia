@@ -1221,18 +1221,18 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
     manager
         .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
         .await
-        .expect("refresh should no-op without chatgpt auth");
+        .expect("refresh should fetch without chatgpt auth for custom providers");
     let cached_remote = manager.get_remote_models().await;
     assert!(
-        !cached_remote
+        cached_remote
             .iter()
             .any(|candidate| candidate.slug == dynamic_slug),
-        "remote refresh should be skipped without chatgpt auth"
+        "remote refresh should fetch for custom providers even without chatgpt auth"
     );
     assert_eq!(
         endpoint.fetch_count(),
-        0,
-        "endpoint that cannot refresh should avoid model fetches"
+        1,
+        "endpoint should fetch models for custom providers"
     );
 }
 
@@ -1324,19 +1324,19 @@ async fn refresh_available_models_skips_network_when_external_api_key_overrides_
     manager
         .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
         .await
-        .expect("refresh should no-op with API key auth");
+        .expect("refresh should fetch with API key auth for custom providers");
     let cached_remote = manager.get_remote_models().await;
 
     assert!(
-        !cached_remote
+        cached_remote
             .iter()
             .any(|candidate| candidate.slug == dynamic_slug),
-        "remote refresh should be skipped when external API key auth is active"
+        "remote refresh should fetch for custom providers even with external API key auth"
     );
     assert_eq!(
         endpoint.fetch_count(),
-        0,
-        "endpoint should avoid model fetches when external API key auth is active"
+        1,
+        "endpoint should fetch models for custom providers with API key auth"
     );
 }
 

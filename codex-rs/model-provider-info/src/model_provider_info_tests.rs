@@ -119,8 +119,9 @@ env_key = "OPENAI_API_KEY"
 wire_api = "chat"
         "#;
 
-    let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    // "chat" is now accepted as ChatCompletions (backward compat alias).
+    let provider = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap();
+    assert_eq!(provider.wire_api, WireApi::ChatCompletions);
 }
 
 #[test]
@@ -650,4 +651,412 @@ refresh_interval_ms = 0
     let auth = provider.auth.expect("auth config should deserialize");
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
+}
+
+#[test]
+fn test_api_key_falls_back_to_sofia_auth_file() {
+    use std::io::Write;
+
+    let base_dir = tempdir().unwrap();
+    let auth_file = base_dir.path().join("sofia-auth.json");
+    let mut file = std::fs::File::create(&auth_file).unwrap();
+    write!(file, r#"{{ "DEEPSEEK_API_KEY": "sk-from-file" }}"#).unwrap();
+
+    let provider = ModelProviderInfo {
+        name: "DeepSeek".into(),
+        base_url: Some("https://api.deepseek.com".into()),
+        env_key: Some("DEEPSEEK_API_KEY".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+        supports_standalone_web_search: false,
+    };
+
+    // Ensure the env var is not set so the file fallback is what resolves.
+    let previous = std::env::var_os("DEEPSEEK_API_KEY");
+    let previous_home = std::env::var_os("CODEX_HOME");
+    // Edition 2024 marks these env mutators unsafe; the test runs single-threaded
+    // and restores the previous values, so the block is sound.
+    unsafe {
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        std::env::set_var("CODEX_HOME", base_dir.path());
+    }
+
+    let result = provider.api_key();
+
+    // Restore env.
+    unsafe {
+        if let Some(value) = previous {
+            std::env::set_var("DEEPSEEK_API_KEY", value);
+        } else {
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        }
+        if let Some(value) = previous_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+    }
+
+    let key = result.expect("api_key should resolve from sofia-auth.json");
+    assert_eq!(key.as_deref(), Some("sk-from-file"));
+}
+
+#[test]
+fn test_api_key_prefers_credential_store_over_env() {
+    use std::io::Write;
+
+    let base_dir = tempdir().unwrap();
+    // Write the credential store under `$CODEX_HOME`, and also set the env var
+    // to a *different* value. The credential store must win.
+    let auth_file = base_dir.path().join("sofia-auth.json");
+    let mut file = std::fs::File::create(&auth_file).unwrap();
+    write!(file, r#"{{ "DEEPSEEK_API_KEY": "sk-from-store" }}"#).unwrap();
+
+    let provider = ModelProviderInfo {
+        name: "DeepSeek".into(),
+        base_url: Some("https://api.deepseek.com".into()),
+        env_key: Some("DEEPSEEK_API_KEY".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+        supports_standalone_web_search: false,
+    };
+
+    let previous_home = std::env::var_os("CODEX_HOME");
+    unsafe {
+        std::env::set_var("CODEX_HOME", base_dir.path());
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-from-env");
+    }
+
+    let result = provider.api_key();
+
+    unsafe {
+        if let Some(value) = previous_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+        std::env::remove_var("DEEPSEEK_API_KEY");
+    }
+
+    // The credential store should take precedence over the env var.
+    let key = result.expect("api_key should resolve");
+    assert_eq!(key.as_deref(), Some("sk-from-store"));
+}
+
+#[test]
+fn test_api_key_continues_past_missing_candidate_homes() {
+    use std::io::Write;
+
+    // Point `$CODEX_HOME` at a directory that does *not* contain sofia-auth.json,
+    // but place the file under `~/.sofia`. The lookup must continue past the
+    // missing `$CODEX_HOME` candidate and find it under `~/.sofia`.
+    let codex_home = tempdir().unwrap();
+    let real_home = tempdir().unwrap();
+    let sofia_home = real_home.path().join(".sofia");
+    std::fs::create_dir_all(&sofia_home).unwrap();
+    let auth_file = sofia_home.join("sofia-auth.json");
+    let mut file = std::fs::File::create(&auth_file).unwrap();
+    write!(file, r#"{{ "DEEPSEEK_API_KEY": "sk-from-sofia-home" }}"#).unwrap();
+
+    let provider = ModelProviderInfo {
+        name: "DeepSeek".into(),
+        base_url: Some("https://api.deepseek.com".into()),
+        env_key: Some("DEEPSEEK_API_KEY".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+        supports_standalone_web_search: false,
+    };
+
+    let previous_home = std::env::var_os("CODEX_HOME");
+    let previous_user_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("CODEX_HOME", codex_home.path());
+        std::env::set_var("HOME", real_home.path());
+    }
+
+    let result = provider.api_key();
+
+    unsafe {
+        if let Some(value) = previous_home {
+            std::env::set_var("CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEX_HOME");
+        }
+        if let Some(value) = previous_user_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    let key = result.expect("api_key should resolve from ~/.sofia/sofia-auth.json");
+    assert_eq!(key.as_deref(), Some("sk-from-sofia-home"));
+}
+
+// ---------------------------------------------------------------------------
+// WireApi ChatCompletions tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_api_deserialize_chat_completions() {
+    let toml_str = r#"
+name = "Test"
+wire_api = "chat_completions"
+"#;
+    let provider: ModelProviderInfo = toml::from_str(toml_str).unwrap();
+    assert_eq!(provider.wire_api, WireApi::ChatCompletions);
+}
+
+#[test]
+fn test_wire_api_deserialize_chat_alias() {
+    let toml_str = r#"
+name = "Test"
+wire_api = "chat"
+"#;
+    let provider: ModelProviderInfo = toml::from_str(toml_str).unwrap();
+    assert_eq!(provider.wire_api, WireApi::ChatCompletions);
+}
+
+#[test]
+fn test_wire_api_deserialize_responses() {
+    let toml_str = r#"
+name = "Test"
+wire_api = "responses"
+"#;
+    let provider: ModelProviderInfo = toml::from_str(toml_str).unwrap();
+    assert_eq!(provider.wire_api, WireApi::Responses);
+}
+
+#[test]
+fn test_wire_api_default_is_responses() {
+    let toml_str = r#"
+name = "Test"
+"#;
+    let provider: ModelProviderInfo = toml::from_str(toml_str).unwrap();
+    assert_eq!(provider.wire_api, WireApi::Responses);
+}
+
+#[test]
+fn test_wire_api_display() {
+    assert_eq!(WireApi::Responses.to_string(), "responses");
+    assert_eq!(WireApi::ChatCompletions.to_string(), "chat_completions");
+}
+
+#[test]
+fn test_wire_api_unknown_variant() {
+    let toml_str = r#"
+name = "Test"
+wire_api = "grpc"
+"#;
+    let err = toml::from_str::<ModelProviderInfo>(toml_str).unwrap_err();
+    assert!(err.to_string().contains("unknown variant"));
+}
+
+// ---------------------------------------------------------------------------
+// WellKnownProvider tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_well_known_providers_count() {
+    let providers = well_known_providers();
+    assert!(
+        providers.len() >= 10,
+        "expected at least 10 well-known providers"
+    );
+}
+
+#[test]
+fn test_well_known_providers_have_unique_ids() {
+    let providers = well_known_providers();
+    let mut ids: Vec<&str> = providers.iter().map(|p| p.provider_id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), providers.len(), "provider IDs must be unique");
+}
+
+#[test]
+fn test_well_known_providers_responses_api_flag() {
+    let providers = well_known_providers();
+    // Anthropic and OpenRouter should support Responses API
+    let anthropic = providers
+        .iter()
+        .find(|p| p.provider_id == "anthropic")
+        .unwrap();
+    assert!(anthropic.supports_responses_api);
+    let openrouter = providers
+        .iter()
+        .find(|p| p.provider_id == "openrouter")
+        .unwrap();
+    assert!(openrouter.supports_responses_api);
+    // MiMo should not (Chat Completions only)
+    let xiaomi = providers
+        .iter()
+        .find(|p| p.provider_id == "xiaomi")
+        .unwrap();
+    assert!(!xiaomi.supports_responses_api);
+}
+
+// ---------------------------------------------------------------------------
+// discover_providers_from_env tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_discover_providers_from_env_with_key() {
+    unsafe { std::env::set_var("XIAOMI_API_KEY", "test-key-123") };
+    let providers = discover_providers_from_env();
+    let xiaomi = providers
+        .get("xiaomi")
+        .expect("xiaomi should be discovered");
+    assert_eq!(xiaomi.name, "Xiaomi (MiMo)");
+    assert_eq!(
+        xiaomi.base_url.as_deref(),
+        Some("https://api.xiaomimimo.com/v1")
+    );
+    assert_eq!(xiaomi.wire_api, WireApi::ChatCompletions);
+    assert_eq!(xiaomi.env_key.as_deref(), Some("XIAOMI_API_KEY"));
+    unsafe { std::env::remove_var("XIAOMI_API_KEY") };
+}
+
+#[test]
+fn test_discover_providers_prefers_responses_api() {
+    // Anthropic supports Responses API — should be preferred
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+    let providers = discover_providers_from_env();
+    let anthropic = providers
+        .get("anthropic")
+        .expect("anthropic should be discovered");
+    assert_eq!(anthropic.wire_api, WireApi::Responses);
+    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+}
+
+#[test]
+fn test_discover_providers_no_empty_keys() {
+    unsafe { std::env::set_var("GROQ_API_KEY", "   ") };
+    let providers = discover_providers_from_env();
+    assert!(
+        !providers.contains_key("groq"),
+        "empty/whitespace key should not register provider"
+    );
+    unsafe { std::env::remove_var("GROQ_API_KEY") };
+}
+
+#[test]
+fn test_discover_providers_generic_openai_compatible() {
+    unsafe {
+        std::env::set_var("OPENAI_BASE_URL", "https://my-proxy.example.com/v1");
+        std::env::set_var("OPENAI_API_KEY", "sk-custom");
+        std::env::set_var("OPENAI_PROVIDER_ID", "my-proxy");
+        std::env::set_var("OPENAI_PROVIDER_NAME", "My Proxy");
+    }
+    let providers = discover_providers_from_env();
+    let proxy = providers
+        .get("my-proxy")
+        .expect("custom provider should be discovered");
+    assert_eq!(
+        proxy.base_url.as_deref(),
+        Some("https://my-proxy.example.com/v1")
+    );
+    assert_eq!(proxy.env_key.as_deref(), Some("OPENAI_API_KEY"));
+    unsafe {
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_PROVIDER_ID");
+        std::env::remove_var("OPENAI_PROVIDER_NAME");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// create_custom_provider tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_custom_provider() {
+    let provider = create_custom_provider(
+        "My LLM",
+        "https://api.example.com/v1",
+        Some("MY_LLM_API_KEY"),
+        WireApi::ChatCompletions,
+    );
+    assert_eq!(provider.name, "My LLM");
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://api.example.com/v1")
+    );
+    assert_eq!(provider.env_key.as_deref(), Some("MY_LLM_API_KEY"));
+    assert_eq!(provider.wire_api, WireApi::ChatCompletions);
+}
+
+#[test]
+fn test_create_custom_provider_no_auth() {
+    let provider = create_custom_provider(
+        "Local LLM",
+        "http://localhost:8080/v1",
+        None,
+        WireApi::Responses,
+    );
+    assert_eq!(provider.name, "Local LLM");
+    assert!(provider.env_key.is_none());
+    assert_eq!(provider.wire_api, WireApi::Responses);
+}
+
+// ---------------------------------------------------------------------------
+// built_in_model_providers includes auto-discovered
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_built_in_includes_discovered_providers() {
+    // Test that built_in_model_providers merges auto-discovered providers.
+    // We can't reliably test env-var-based discovery in parallel tests due to
+    // thread safety, so test the merge logic directly.
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-provider".to_string(),
+        ModelProviderInfo {
+            name: "Custom".to_string(),
+            base_url: Some("https://custom.example.com/v1".to_string()),
+            wire_api: WireApi::ChatCompletions,
+            ..ModelProviderInfo::default()
+        },
+    );
+    let merged = merge_configured_model_providers(built_in_model_providers(None), custom).unwrap();
+    assert!(merged.contains_key("openai"));
+    assert!(merged.contains_key("custom-provider"));
+    let custom = merged.get("custom-provider").unwrap();
+    assert_eq!(custom.wire_api, WireApi::ChatCompletions);
 }

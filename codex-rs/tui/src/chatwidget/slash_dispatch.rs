@@ -401,6 +401,9 @@ impl ChatWidget {
             SlashCommand::Logout => {
                 self.app_event_tx.send(AppEvent::Logout);
             }
+            SlashCommand::Connect => {
+                self.open_connect_provider_popup();
+            }
             SlashCommand::Copy => {
                 self.show_copy_picker();
             }
@@ -1156,6 +1159,7 @@ impl ChatWidget {
             | SlashCommand::Compact
             | SlashCommand::Review
             | SlashCommand::Model
+            | SlashCommand::Connect
             | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Goal

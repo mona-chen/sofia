@@ -66,6 +66,7 @@ pub enum SlashCommand {
     Quit,
     Exit,
     Feedback,
+    Connect,
     Rollout,
     Ps,
     #[strum(to_string = "stop", serialize = "clean")]
@@ -146,6 +147,7 @@ impl SlashCommand {
             SlashCommand::Apps => "manage apps",
             SlashCommand::Plugins => "browse plugins",
             SlashCommand::Logout => "log out of Codex",
+            SlashCommand::Connect => "connect to a model provider and configure API keys",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
         }
@@ -222,6 +224,7 @@ impl SlashCommand {
             | SlashCommand::Plan
             | SlashCommand::Cd
             | SlashCommand::Clear
+            | SlashCommand::Connect
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,

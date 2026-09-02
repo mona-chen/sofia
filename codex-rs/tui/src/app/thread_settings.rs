@@ -56,9 +56,13 @@ impl App {
             })
         });
 
+        // Extract provider prefix from model string (e.g., "xiaomi/mimo-v2.5" → "xiaomi").
+        let model_provider = model.split('/').next().map(String::from);
+
         let mut params = ThreadSettingsUpdateParams {
             thread_id: thread_id.to_string(),
             model: Some(model),
+            model_provider,
             collaboration_mode: Some(self.chat_widget.effective_collaboration_mode()),
             ..ThreadSettingsUpdateParams::default()
         };

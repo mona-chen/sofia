@@ -441,7 +441,9 @@ fn config_summary_entries(
             ),
         ),
     ];
-    if config.model_provider.wire_api == WireApi::Responses {
+    if config.model_provider.wire_api == WireApi::Responses
+        || config.model_provider.wire_api == WireApi::ChatCompletions
+    {
         entries.push((
             "reasoning effort",
             config

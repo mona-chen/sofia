@@ -54,7 +54,6 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -65,12 +64,17 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// The Chat Completions API exposed by OpenAI-compatible providers at
+    /// `/v1/chat/completions`. Used for MiMo, OpenRouter, Groq, Together,
+    /// and any other provider that speaks the OpenAI chat format.
+    ChatCompletions,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
         };
         f.write_str(value)
     }
@@ -84,8 +88,11 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
-            "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            "chat" | "chat_completions" | "chatcompletions" => Ok(Self::ChatCompletions),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "chat", "chat_completions", "chatcompletions"],
+            )),
         }
     }
 }
@@ -336,12 +343,16 @@ impl ModelProviderInfo {
     /// If `env_key` is Some, returns the API key for this provider if present
     /// (and non-empty) in the environment. If `env_key` is required but
     /// cannot be found, returns an error.
+    ///
+    /// The credential store (`sofia-auth.json`, keyed by the env var name) takes
+    /// precedence over the process environment. The file is resolved from
+    /// `$CODEX_HOME`, then `~/.sofia`, then `~/.config/sofia`, then `~/.codex`.
     pub fn api_key(&self) -> CodexResult<Option<String>> {
         match &self.env_key {
             Some(env_key) => {
-                let api_key = std::env::var(env_key)
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
+                let api_key = self
+                    .api_key_from_auth_file(env_key)
+                    .or_else(|| std::env::var(env_key).ok().filter(|v| !v.trim().is_empty()))
                     .ok_or_else(|| {
                         CodexErr::EnvVar(EnvVarError {
                             var: env_key.clone(),
@@ -352,6 +363,37 @@ impl ModelProviderInfo {
             }
             None => Ok(None),
         }
+    }
+
+    /// Read the API key for `env_key` from `sofia-auth.json`, if present.
+    fn api_key_from_auth_file(&self, env_key: &str) -> Option<String> {
+        let codex_home = codex_utils_home_dir::codex_home_string();
+        let mut candidates = vec![std::path::PathBuf::from(&codex_home)];
+        // Also check legacy locations for backward compatibility.
+        for home in home_dir().into_iter() {
+            candidates.push(home.join(".sofia"));
+            candidates.push(home.join(".config").join("sofia"));
+            candidates.push(home.join(".codex"));
+        }
+        // Deduplicate so we don't check the same dir twice.
+        candidates.sort();
+        candidates.dedup();
+        for candidate in candidates {
+            let file = candidate.join("sofia-auth.json");
+            let Ok(contents) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if let Some(value) = parsed.get(env_key).and_then(serde_json::Value::as_str) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Effective maximum number of request retries for this provider.
@@ -499,6 +541,13 @@ pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 
 /// Built-in default provider list.
+///
+/// Includes:
+/// 1. OpenAI (always present, with optional base URL override)
+/// 2. Amazon Bedrock providers
+/// 3. OSS providers (Ollama, LMStudio)
+/// 4. Auto-discovered providers from environment variables (ANTHROPIC_API_KEY,
+///    OPENROUTER_API_KEY, GROQ_API_KEY, XIAOMI_API_KEY, etc.)
 pub fn built_in_model_providers(
     openai_base_url: Option<String>,
 ) -> HashMap<String, ModelProviderInfo> {
@@ -508,11 +557,7 @@ pub fn built_in_model_providers(
     let amazon_bedrock_runtime_provider =
         P::create_amazon_bedrock_runtime_provider(/*aws*/ None);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
-    [
+    let mut providers: HashMap<String, ModelProviderInfo> = [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
         (
@@ -530,7 +575,16 @@ pub fn built_in_model_providers(
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
-    .collect()
+    .collect();
+
+    // Auto-discover providers from environment variables.
+    // These extend (not override) the built-in set.
+    let discovered = discover_providers_from_env();
+    for (id, info) in discovered {
+        providers.entry(id).or_insert(info);
+    }
+
+    providers
 }
 
 /// Merge configured providers into the built-in provider catalog.
@@ -622,6 +676,223 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
     }
 }
 
+/// Well-known provider definitions for auto-discovery from environment variables.
+/// Each entry maps an env var to a provider ID, name, base URL, and wire API.
+/// When the env var is set and non-empty, the provider is automatically registered.
+pub fn well_known_providers() -> Vec<WellKnownProvider> {
+    vec![
+        WellKnownProvider {
+            env_key: "ANTHROPIC_API_KEY",
+            provider_id: "anthropic",
+            provider_name: "Anthropic",
+            base_url: "https://api.anthropic.com/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: true,
+        },
+        WellKnownProvider {
+            env_key: "OPENROUTER_API_KEY",
+            provider_id: "openrouter",
+            provider_name: "OpenRouter",
+            base_url: "https://openrouter.ai/api/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: true,
+        },
+        WellKnownProvider {
+            env_key: "GROQ_API_KEY",
+            provider_id: "groq",
+            provider_name: "Groq",
+            base_url: "https://api.groq.com/openai/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "TOGETHER_API_KEY",
+            provider_id: "together",
+            provider_name: "Together AI",
+            base_url: "https://api.together.xyz/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "DEEPSEEK_API_KEY",
+            provider_id: "deepseek",
+            provider_name: "DeepSeek",
+            base_url: "https://api.deepseek.com/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "MISTRAL_API_KEY",
+            provider_id: "mistral",
+            provider_name: "Mistral AI",
+            base_url: "https://api.mistral.ai/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "XIAOMI_API_KEY",
+            provider_id: "xiaomi",
+            provider_name: "Xiaomi (MiMo)",
+            base_url: "https://api.xiaomimimo.com/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "FIREWORKS_API_KEY",
+            provider_id: "fireworks",
+            provider_name: "Fireworks AI",
+            base_url: "https://api.fireworks.ai/inference/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "CEREBRAS_API_KEY",
+            provider_id: "cerebras",
+            provider_name: "Cerebras",
+            base_url: "https://api.cerebras.ai/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "GEMINI_API_KEY",
+            provider_id: "google",
+            provider_name: "Google Gemini",
+            base_url: "https://generativelanguage.googleapis.com/v1beta",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "COHERE_API_KEY",
+            provider_id: "cohere",
+            provider_name: "Cohere",
+            base_url: "https://api.cohere.com/v2",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "PERPLEXITY_API_KEY",
+            provider_id: "perplexity",
+            provider_name: "Perplexity",
+            base_url: "https://api.perplexity.ai",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: false,
+        },
+        WellKnownProvider {
+            env_key: "XAI_API_KEY",
+            provider_id: "xai",
+            provider_name: "xAI (Grok)",
+            base_url: "https://api.x.ai/v1",
+            wire_api: WireApi::ChatCompletions,
+            supports_responses_api: true,
+        },
+    ]
+}
+
+/// A well-known provider that can be auto-discovered from an environment variable.
+#[derive(Debug, Clone)]
+pub struct WellKnownProvider {
+    pub env_key: &'static str,
+    pub provider_id: &'static str,
+    pub provider_name: &'static str,
+    pub base_url: &'static str,
+    pub wire_api: WireApi,
+    /// If true, this provider also supports the Responses API and should be
+    /// preferred over Chat Completions when available.
+    pub supports_responses_api: bool,
+}
+
+/// Auto-discover providers from environment variables.
+///
+/// Scans well-known env vars (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, etc.)
+/// and returns a provider map for any that are set and non-empty.
+/// When a provider supports the Responses API, it is preferred over Chat
+/// Completions. Also scans for generic `OPENAI_BASE_URL` + `OPENAI_API_KEY`
+/// pairs.
+pub fn discover_providers_from_env() -> HashMap<String, ModelProviderInfo> {
+    let mut providers = HashMap::new();
+
+    // Well-known providers — prefer Responses API when supported.
+    for wk in well_known_providers() {
+        if let Ok(key) = std::env::var(wk.env_key) {
+            if !key.trim().is_empty() {
+                let wire_api = if wk.supports_responses_api {
+                    WireApi::Responses
+                } else {
+                    wk.wire_api
+                };
+                providers.insert(
+                    wk.provider_id.to_string(),
+                    ModelProviderInfo {
+                        name: wk.provider_name.to_string(),
+                        base_url: Some(wk.base_url.to_string()),
+                        env_key: Some(wk.env_key.to_string()),
+                        wire_api,
+                        ..ModelProviderInfo::default()
+                    },
+                );
+            }
+        }
+    }
+
+    // Generic OpenAI-compatible provider from env vars
+    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+        if !base_url.trim().is_empty() {
+            let api_key = std::env::var("OPENAI_API_KEY").ok();
+            let name =
+                std::env::var("OPENAI_PROVIDER_NAME").unwrap_or_else(|_| "custom".to_string());
+            let provider_id =
+                std::env::var("OPENAI_PROVIDER_ID").unwrap_or_else(|_| "custom".to_string());
+            let wire_api_str =
+                std::env::var("OPENAI_WIRE_API").unwrap_or_else(|_| "responses".to_string());
+            let wire_api = match wire_api_str.as_str() {
+                "chat" | "chat_completions" => WireApi::ChatCompletions,
+                _ => WireApi::Responses,
+            };
+
+            let mut info = ModelProviderInfo {
+                name,
+                base_url: Some(base_url),
+                wire_api,
+                ..ModelProviderInfo::default()
+            };
+            if let Some(key) = api_key {
+                if !key.trim().is_empty() {
+                    info.env_key = Some("OPENAI_API_KEY".to_string());
+                }
+            }
+            providers.insert(provider_id, info);
+        }
+    }
+
+    providers
+}
+
+/// Register a custom provider from explicit parameters.
+///
+/// This is the programmatic API for adding any provider without limits.
+/// Used by OpenWork and other managed runtimes to inject providers at spawn.
+pub fn create_custom_provider(
+    name: &str,
+    base_url: &str,
+    env_key: Option<&str>,
+    wire_api: WireApi,
+) -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: name.to_string(),
+        base_url: Some(base_url.to_string()),
+        env_key: env_key.map(|s| s.to_string()),
+        wire_api,
+        ..ModelProviderInfo::default()
+    }
+}
+
 #[cfg(test)]
 #[path = "model_provider_info_tests.rs"]
 mod tests;
+
+/// Resolve the current user's home directory from the environment.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}

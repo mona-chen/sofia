@@ -1877,13 +1877,19 @@ impl ThreadManagerState {
             starting.retain(|runtime| runtime.strong_count() != 0);
             starting.push(Arc::downgrade(&source_changed_during_startup));
         }
+        // Use a model manager built from the session's own config so it resolves
+        // model metadata against the session's active provider (e.g. a provider
+        // configured via `/connect`). The process-wide manager is built once at
+        // startup from the default provider and would otherwise miss
+        // custom-provider models such as `mimo-v2.5`.
+        let session_models_manager = build_models_manager(&config, Arc::clone(&auth_manager));
         let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            models_manager: session_models_manager,
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),

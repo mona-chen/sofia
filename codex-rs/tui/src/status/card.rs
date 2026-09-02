@@ -299,7 +299,9 @@ impl StatusHistoryCell {
                 ),
             ),
         ];
-        if config.model_provider.wire_api == WireApi::Responses {
+        if config.model_provider.wire_api == WireApi::Responses
+            || config.model_provider.wire_api == WireApi::ChatCompletions
+        {
             let effort_value = reasoning_effort_override
                 .unwrap_or_else(|| config.model_reasoning_effort.clone())
                 .map(|effort| effort.to_string())
@@ -727,7 +729,7 @@ impl HistoryCell for StatusHistoryCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(vec![
             Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
-            Span::from("OpenAI Codex").bold(),
+            Span::from("Sofia").bold(),
             Span::from(" ").dim(),
             Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
         ]));

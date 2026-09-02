@@ -2226,6 +2226,18 @@ async fn try_run_sampling_request(
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
+    // State-based continuation: detect when the prompt ended with tool results
+    // but the model stopped without calling tools. Mirrors mimocode's
+    // classifyAssistantStep pattern — force continuation so the model keeps
+    // working instead of producing a text summary mid-task.
+    const MAX_TOOL_RESULT_CONTINUE: u32 = 3;
+    let mut tool_result_continue_count: u32 = 0;
+    let prompt_ends_with_tool_output = prompt
+        .input
+        .last()
+        .map(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
+        .unwrap_or(false);
+    let mut tool_calls_this_request: u32 = 0;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
@@ -2308,6 +2320,7 @@ async fn try_run_sampling_request(
                     };
                     if let Some(call_id) = call_id {
                         analytics_tool_call_ids.push(call_id.to_string());
+                    tool_calls_this_request += 1;
                     }
                 }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
@@ -2575,6 +2588,24 @@ async fn try_run_sampling_request(
                     break Err(err);
                 }
                 if let Some(false) = end_turn {
+                    needs_follow_up = true;
+                }
+                // State-based continuation: if the prompt ended with tool results
+                // (FunctionCallOutput) but the model stopped without calling any
+                // tools, force continuation — the model is likely summarizing
+                // instead of acting. Bounded by MAX_TOOL_RESULT_CONTINUE.
+                if !needs_follow_up
+                    && tool_calls_this_request == 0
+                    && prompt_ends_with_tool_output
+                    && tool_result_continue_count < MAX_TOOL_RESULT_CONTINUE
+                {
+                    tool_result_continue_count += 1;
+                    warn!(
+                        tool_result_continue_count,
+                        max = MAX_TOOL_RESULT_CONTINUE,
+                        text_len = last_agent_message.as_ref().map_or(0, |m| m.len()),
+                        "try_run_sampling_request: model stopped after tool results — forcing continuation"
+                    );
                     needs_follow_up = true;
                 }
                 break Ok(SamplingRequestResult {

@@ -399,6 +399,44 @@ pub(crate) enum AppEvent {
     /// Request app-server account logout, then exit after it succeeds.
     Logout,
 
+    /// A provider was selected from the /connect popup.
+    ConnectProvider {
+        provider_id: String,
+        provider_name: String,
+        base_url: String,
+        wire_api: String,
+    },
+
+    /// Save the API key for a provider and fetch its model list.
+    SaveProviderApiKey {
+        provider_id: String,
+        provider_name: String,
+        base_url: String,
+        wire_api: String,
+        api_key: String,
+    },
+
+    /// A model was selected — show the effort picker.
+    SelectModel {
+        provider_id: String,
+        model_id: String,
+    },
+
+    /// Final step: save provider + model + effort to config, close modal.
+    FinalizeProviderSetup {
+        provider_id: String,
+        model_id: String,
+        effort: String,
+    },
+
+    /// Async model list fetch completed (or failed). Spawned from the
+    /// `SaveProviderApiKey` handler to avoid blocking the TUI thread with curl.
+    ModelsFetched {
+        provider_id: String,
+        provider_name: String,
+        result: Result<Vec<String>, String>,
+    },
+
     /// Request to exit the application due to a fatal error.
     #[allow(dead_code)]
     FatalExitRequest(String),

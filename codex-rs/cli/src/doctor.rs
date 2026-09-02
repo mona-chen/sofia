@@ -3074,7 +3074,49 @@ fn push_env_path_detail(details: &mut Vec<String>, label: &str, name: &str) {
 }
 
 fn env_var_present(name: &str) -> bool {
-    env::var_os(name).is_some_and(|value| !value.is_empty())
+    if env::var_os(name).is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    // Fall back to the credential store so `doctor` reflects runtime behavior:
+    // the engine resolves provider keys from `sofia-auth.json` even when the
+    // process env var is unset.
+    credential_store_has(name)
+}
+
+/// Returns true when `name` is present (and non-empty) in the engine's
+/// `sofia-auth.json` credential store, searched across the same candidate home
+/// directories used at runtime.
+fn credential_store_has(name: &str) -> bool {
+    // Use the canonical Codex home from the shared utility crate.
+    let codex_home = codex_utils_home_dir::codex_home_string();
+    let mut candidates = vec![std::path::PathBuf::from(&codex_home)];
+    // Also check legacy locations for backward compatibility.
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        let home = std::path::PathBuf::from(home);
+        candidates.push(home.join(".sofia"));
+        candidates.push(home.join(".config").join("sofia"));
+        candidates.push(home.join(".codex"));
+    }
+    // Deduplicate candidates so we don't check the same dir twice.
+    candidates.sort();
+    candidates.dedup();
+    for dir in candidates {
+        let file = dir.join("sofia-auth.json");
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(value) = parsed.get(name).and_then(serde_json::Value::as_str) {
+            if !value.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn human_output_options(command: &DoctorCommand) -> HumanOutputOptions {

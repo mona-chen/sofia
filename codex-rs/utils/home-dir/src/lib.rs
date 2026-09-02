@@ -2,9 +2,12 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use dirs::home_dir;
 use std::path::PathBuf;
 
-/// Returns the path to the Codex configuration directory, which can be
+/// Returns the path to the Sofia configuration directory, which can be
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
+/// `~/.sofia`.
+///
+/// Sofia is intentionally isolated from OpenAI's Codex/`~/.codex` so the two
+/// never share (or clobber) state.
 ///
 /// - If `CODEX_HOME` is set, the value must exist and be a directory. The
 ///   value will be canonicalized and this function will Err otherwise.
@@ -15,6 +18,22 @@ pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
         .ok()
         .filter(|val| !val.is_empty());
     find_codex_home_from_env(codex_home_env.as_deref())
+}
+
+/// Returns the Codex home directory as a plain `String`, suitable for
+/// string interpolation in path construction. Falls back to `~/.sofia`
+/// when the canonical resolution fails (e.g. CODEX_HOME unset and the
+/// home directory is unavailable). Prefer `find_codex_home()` when you
+/// need an absolute, canonicalized path.
+pub fn codex_home_string() -> String {
+    find_codex_home()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/tmp".to_string());
+            format!("{home}/.sofia")
+        })
 }
 
 fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
@@ -56,7 +75,7 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
                     "Could not find home directory",
                 )
             })?;
-            p.push(".codex");
+            p.push(".sofia");
             AbsolutePathBuf::from_absolute_path(p)
         }
     }
@@ -127,7 +146,7 @@ mod tests {
         let resolved =
             find_codex_home_from_env(/*codex_home_env*/ None).expect("default CODEX_HOME");
         let mut expected = home_dir().expect("home dir");
-        expected.push(".codex");
+        expected.push(".sofia");
         let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
         assert_eq!(resolved, expected);
     }
