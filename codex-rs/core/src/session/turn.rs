@@ -309,6 +309,7 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    let mut tool_result_continue_count: u32 = 0;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -398,6 +399,7 @@ pub(crate) async fn run_turn(
                 &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
+                tool_result_continue_count,
             )
             .await
         }
@@ -407,7 +409,9 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    tool_result_continue_count: returned_continue_count,
                 } = sampling_request_output;
+                tool_result_continue_count = returned_continue_count;
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -1388,6 +1392,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
+    tool_result_continue_count: u32,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_prompt_base_instructions().await;
@@ -1437,6 +1442,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
+            tool_result_continue_count,
         )
         .await
         {
@@ -1621,6 +1627,7 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    tool_result_continue_count: u32,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2235,6 +2242,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
+    mut tool_result_continue_count: u32,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2279,32 +2287,34 @@ async fn try_run_sampling_request(
     // classifyAssistantStep pattern — force continuation so the model keeps
     // working instead of producing a text summary mid-task.
     const MAX_TOOL_RESULT_CONTINUE: u32 = 3;
-    let mut tool_result_continue_count: u32 = 0;
-    // Detect unresolved tool results: is there a FunctionCallOutput in the
-    // prompt that was NOT followed by a FunctionCall (i.e. the model received
-    // tool results but didn't call any tools)? This handles the common case
-    // where the user types "continue" after the model stopped mid-task:
+    // tool_result_continue_count is now passed in from the outer loop
+    // and flows back via SamplingRequestResult.
     //
-    //   [FunctionCallOutput]  ← tool results
-    //   [Message: assistant]  ← text summary, no tool calls
-    //   [Message: user]       ← "continue"
-    //
-    // The old check looked at the LAST item (user message), missing this pattern.
+    // Detect unresolved tool results in the MOST RECENT tool batch only.
+    // We scan backwards from the end of the prompt, skipping past any
+    // trailing assistant Message (which is the model's text response to
+    // tool results). We only consider tool results after the last assistant
+    // Message as "unresolved" — older tool results are already handled.
     let has_unresolved_tool_results = {
+        // Find the last assistant message in the prompt (if any)
+        let last_assistant_msg_pos = prompt.input.iter().rposition(|item| {
+            matches!(item, ResponseItem::Message { role, .. } if role == "assistant")
+        });
+
+        // Scan only items AFTER the last assistant message (or all items
+        // if there is no assistant message)
+        let start = last_assistant_msg_pos.map_or(0, |pos| pos + 1);
         let mut last_was_function_call_output = false;
         let mut has_trailing_tool_output = false;
-        for item in &prompt.input {
+        for item in &prompt.input[start..] {
             match item {
                 ResponseItem::FunctionCallOutput { .. } => {
                     last_was_function_call_output = true;
                 }
                 ResponseItem::FunctionCall { .. } => {
-                    // A FunctionCall "consumes" the preceding FunctionCallOutput.
                     last_was_function_call_output = false;
                 }
                 _ => {
-                    // Any non-tool item after FunctionCallOutput means
-                    // the model didn't respond with a tool call.
                     if last_was_function_call_output {
                         has_trailing_tool_output = true;
                     }
@@ -2312,8 +2322,6 @@ async fn try_run_sampling_request(
                 }
             }
         }
-        // Also catch the case where the prompt ends with FunctionCallOutput
-        // (tool results delivered, model hasn't responded yet).
         if last_was_function_call_output {
             has_trailing_tool_output = true;
         }
@@ -2325,7 +2333,7 @@ async fn try_run_sampling_request(
         .map(|item| match item {
             ResponseItem::FunctionCallOutput { .. } => "FunctionCallOutput",
             ResponseItem::FunctionCall { .. } => "FunctionCall",
-            ResponseItem::Message { role, .. } => "Message",
+            ResponseItem::Message { .. } => "Message",
             ResponseItem::Reasoning { .. } => "Reasoning",
             _ => "Other",
         })
@@ -2517,6 +2525,7 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        tool_result_continue_count,
                     });
                 }
             }
@@ -2715,6 +2724,7 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    tool_result_continue_count,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
