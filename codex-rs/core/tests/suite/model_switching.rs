@@ -6,7 +6,6 @@ use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
@@ -128,6 +127,7 @@ fn test_model_info(
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
@@ -345,6 +345,20 @@ async fn rollback_first_turn_model_change_removes_its_instructions(
 
     let request = &response_mock.requests()[1];
     assert_eq!(request.body_json()["model"], followup_model);
+    let misaligned_messages = request
+        .inputs_of_type("message")
+        .into_iter()
+        .filter(|message| {
+            message["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .as_array()
+                .is_some_and(|kinds| {
+                    message["content"]
+                        .as_array()
+                        .is_none_or(|content| content.len() != kinds.len())
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(misaligned_messages, Vec::<serde_json::Value>::new());
     let model_switch_count = request
         .message_input_texts("developer")
         .iter()
@@ -427,7 +441,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     let rollout_path = test.codex.rollout_path().expect("rollout path");
     let model_states = std::fs::read_to_string(rollout_path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -978,6 +992,7 @@ async fn model_change_from_multimodal_to_text_strips_prior_media_content() -> Re
     assert_eq!(requests.len(), 2, "expected two model requests");
 
     let first_request = requests.first().expect("expected first request");
+    assert!(first_request.has_content_kinds(&["user.image", "user.audio", "user.text"]));
     assert!(
         !first_request.message_input_image_urls("user").is_empty(),
         "first request should include the uploaded image"
@@ -988,6 +1003,11 @@ async fn model_change_from_multimodal_to_text_strips_prior_media_content() -> Re
     );
 
     let second_request = requests.last().expect("expected second request");
+    assert!(second_request.has_content_kinds(&[
+        "images.unsupported",
+        "audio.unsupported",
+        "user.text",
+    ]));
     assert!(
         second_request.message_input_image_urls("user").is_empty(),
         "second request should strip unsupported image content"
@@ -1344,6 +1364,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),

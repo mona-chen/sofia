@@ -9,6 +9,7 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::model_catalog::LUNA_RESERVE_MODEL;
 use crate::status::format_credit_micros;
 use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
@@ -215,7 +216,7 @@ impl ChatWidget {
 
         self.set_status_line(status_line_from_segments(
             segments,
-            self.config.tui_status_line_use_colors,
+            self.local_settings.tui.status_line_use_colors,
         ));
         let hyperlink_url = selections
             .status_line_items
@@ -244,11 +245,15 @@ impl ChatWidget {
     /// Empty selections clear the managed title. Non-empty selections render the
     /// current values in configured order, skip unavailable segments, and cache
     /// the last successfully written title so redundant OSC writes are avoided.
-    /// When the `activity` item is present in an animated running state, this also
-    /// schedules the next frame so the title animation keeps advancing.
+    /// Animated titles record their next refresh for the foreground loop, independently
+    /// of full TUI redraws.
     fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
         self.last_terminal_title_requires_action =
             self.terminal_title_shows_action_required_with_selections(selections);
+        let now = Instant::now();
+        self.terminal_title_next_refresh = self
+            .terminal_title_animation_interval_with_selections(selections)
+            .map(|interval| now + interval);
         if selections.terminal_title_items.is_empty() {
             if let Err(err) = self.clear_managed_terminal_title() {
                 tracing::debug!(error = %err, "failed to clear terminal title");
@@ -256,13 +261,8 @@ impl ChatWidget {
             return;
         }
 
-        let now = Instant::now();
         let title = self.terminal_title_text_for_selections(selections, now);
-        let animation_interval = self.terminal_title_animation_interval_with_selections(selections);
         if self.last_terminal_title == title {
-            if let Some(interval) = animation_interval {
-                self.frame_requester.schedule_frame_in(interval);
-            }
             return;
         }
         match title {
@@ -285,10 +285,6 @@ impl ChatWidget {
                 }
             }
         }
-
-        if let Some(interval) = animation_interval {
-            self.frame_requester.schedule_frame_in(interval);
-        }
     }
 
     /// Recomputes both status surfaces from one shared config snapshot.
@@ -298,6 +294,8 @@ impl ChatWidget {
     /// warnings once, synchronizes shared cached state (such as git-branch
     /// lookup), then renders each surface from that shared snapshot.
     pub(crate) fn refresh_status_surfaces(&mut self) {
+        self.bottom_pane
+            .set_luna_reserve_active(self.current_model() == LUNA_RESERVE_MODEL);
         let selections = self.status_surface_selections();
         self.warn_invalid_status_line_items_once(&selections.invalid_status_line_items);
         self.warn_invalid_terminal_title_items_once(&selections.invalid_terminal_title_items);
@@ -363,7 +361,7 @@ impl ChatWidget {
     }
 
     fn action_required_terminal_title_prefix_at(&self, now: Instant) -> &'static str {
-        if !self.config.animations {
+        if !self.local_settings.tui.animations {
             return TERMINAL_TITLE_ACTION_REQUIRED_PREFIX;
         }
 
@@ -390,7 +388,7 @@ impl ChatWidget {
         &self,
         selections: &StatusSurfaceSelections,
     ) -> Option<Duration> {
-        if self.config.animations
+        if self.local_settings.tui.animations
             && self.terminal_title_shows_action_required_with_selections(selections)
         {
             return Some(TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL);
@@ -428,12 +426,16 @@ impl ChatWidget {
     }
 
     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
-        self.config.tui_status_line.clone().unwrap_or_else(|| {
-            DEFAULT_STATUS_LINE_ITEMS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        })
+        self.local_settings
+            .tui
+            .status_line
+            .clone()
+            .unwrap_or_else(|| {
+                DEFAULT_STATUS_LINE_ITEMS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            })
     }
 
     /// Parses configured terminal-title ids into known items and collects unknown ids.
@@ -445,12 +447,16 @@ impl ChatWidget {
 
     /// Returns the configured terminal-title ids, or the default ordering when unset.
     pub(super) fn configured_terminal_title_items(&self) -> Vec<String> {
-        self.config.tui_terminal_title.clone().unwrap_or_else(|| {
-            DEFAULT_TERMINAL_TITLE_ITEMS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        })
+        self.local_settings
+            .tui
+            .terminal_title
+            .clone()
+            .unwrap_or_else(|| {
+                DEFAULT_TERMINAL_TITLE_ITEMS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            })
     }
 
     fn status_line_cwd(&self) -> &Path {
@@ -965,7 +971,7 @@ impl ChatWidget {
     }
 
     pub(super) fn terminal_title_spinner_text_at(&self, now: Instant) -> Option<String> {
-        if !self.config.animations {
+        if !self.local_settings.tui.animations {
             return None;
         }
 
@@ -984,11 +990,15 @@ impl ChatWidget {
     }
 
     fn terminal_title_uses_activity(&self) -> bool {
-        self.config.tui_terminal_title.as_ref().is_none_or(|items| {
-            items
-                .iter()
-                .any(|item| item == "activity" || item == "spinner")
-        })
+        self.local_settings
+            .tui
+            .terminal_title
+            .as_ref()
+            .is_none_or(|items| {
+                items
+                    .iter()
+                    .any(|item| item == "activity" || item == "spinner")
+            })
     }
 
     fn terminal_title_has_active_progress(&self) -> bool {
@@ -1000,20 +1010,20 @@ impl ChatWidget {
     }
 
     pub(super) fn should_animate_terminal_title_spinner(&self) -> bool {
-        self.config.animations
+        self.local_settings.tui.animations
             && self.terminal_title_uses_activity()
             && self.terminal_title_has_active_progress()
     }
 
     pub(super) fn should_animate_terminal_title_action_required(&self) -> bool {
-        self.config.animations && self.terminal_title_shows_action_required()
+        self.local_settings.tui.animations && self.terminal_title_shows_action_required()
     }
 
     fn should_animate_terminal_title_spinner_with_selections(
         &self,
         selections: &StatusSurfaceSelections,
     ) -> bool {
-        self.config.animations
+        self.local_settings.tui.animations
             && selections
                 .terminal_title_items
                 .contains(&TerminalTitleItem::Spinner)

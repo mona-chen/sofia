@@ -26,6 +26,8 @@ impl AppServerSession {
         self.background_rollout_migration_enabled = config
             .features
             .enabled(Feature::BackgroundPaginatedRolloutMigration);
+        self.task_tool_capabilities_dir = (!self.uses_embedded_app_server())
+            .then(|| config.codex_home.join("tui-thread-reference-capabilities"));
         self
     }
 
@@ -48,6 +50,7 @@ impl AppServerSession {
 
     pub(crate) async fn resume_thread(
         &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
         config: Config,
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
@@ -67,6 +70,8 @@ impl AppServerSession {
             self.remote_cwd_override.as_deref(),
             model_settings,
         );
+        self.thread_tool_transport()
+            .configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self
@@ -134,6 +139,7 @@ impl AppServerSession {
             response.turns_backwards_cursor.clone(),
             response.items_backwards_cursor.clone(),
             Some(&config),
+            Some(local_settings),
             HistoryHydrationScope::Initial,
         )
         .await?;
@@ -144,6 +150,10 @@ impl AppServerSession {
             started_thread_from_resume_response(response, &config, self.thread_params_mode())
                 .await?;
         started.session.fork_parent_title = fork_parent_title;
+        if self.task_tools_available(thread_id) {
+            self.remember_task_tool_thread(thread_id);
+            started.task_tools_available = true;
+        }
         Ok(started)
     }
 }

@@ -20,13 +20,14 @@ use super::SESSIONS_SUBDIR;
 use super::compression;
 use super::rollout_file_name::RolloutFileName;
 use crate::RolloutItem;
-use crate::RolloutLine;
 use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::RolloutId;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -68,7 +69,7 @@ pub struct ThreadItem {
     /// Git commit SHA from session metadata.
     pub git_sha: Option<String>,
     /// Git origin URL from session metadata.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
     /// Session source from session metadata.
     pub source: Option<SessionSource>,
     /// Persisted thread history contract selected when this thread was created.
@@ -81,6 +82,10 @@ pub struct ThreadItem {
     pub agent_role: Option<String>,
     /// Model provider from session metadata.
     pub model_provider: Option<String>,
+    /// Latest persisted model in SQLite-owned metadata, when available.
+    pub model: Option<String>,
+    /// Latest persisted reasoning effort in SQLite-owned metadata, when available.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// CLI version from session metadata.
     pub cli_version: Option<String>,
     /// RFC3339 timestamp string for when the session was created, if available.
@@ -108,7 +113,7 @@ struct HeadTailSummary {
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
     git_sha: Option<String>,
-    git_origin_url: Option<String>,
+    git_origin_url: Option<SanitizedGitUrl>,
     source: Option<SessionSource>,
     history_mode: ThreadHistoryMode,
     parent_thread_id: Option<ThreadId>,
@@ -848,6 +853,8 @@ async fn build_thread_item(
             agent_nickname,
             agent_role,
             model_provider,
+            model: None,
+            reasoning_effort: None,
             cli_version,
             created_at,
             recency_at: summary_updated_at.clone(),
@@ -1120,7 +1127,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
         }
         lines_scanned += 1;
 
-        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
+        let parsed = crate::parse_rollout_line(trimmed);
         let rollout_line = match parsed {
             Ok(rollout_line) => rollout_line,
             Err(_) => {
@@ -1173,8 +1180,16 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
-            RolloutItem::WorldState(_) | RolloutItem::SecurityRiskScore(_) => {
+            RolloutItem::TokenUsageRecord(_) => {
                 // Not included in `head`; skip.
+            }
+            RolloutItem::RetainedContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_) => {
+                // Not included in `head`; skip.
+            }
+            RolloutItem::RealtimeItem(_) => {
+                // Realtime presentation does not affect model-visible thread summaries.
             }
             RolloutItem::Compacted(_) => {
                 // Not included in `head`; skip.
@@ -1225,7 +1240,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
+        if let Ok(rollout_line) = crate::parse_rollout_line(trimmed) {
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta_line) => {
                     if let Ok(value) = serde_json::to_value(session_meta_line) {
@@ -1245,7 +1260,10 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {}
             }
@@ -1281,7 +1299,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+        let Ok(rollout_line) = crate::parse_rollout_line(trimmed) else {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 crate::recorder::reject_unknown_thread_history_mode(&value)?;
             }
@@ -1298,7 +1316,10 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }

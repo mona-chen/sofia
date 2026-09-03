@@ -6,7 +6,6 @@ use codex_core::config::AgentRoleConfig;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
@@ -98,6 +97,7 @@ fn test_model_info(
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers,
@@ -235,7 +235,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description.contains(
-            "Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason."
+            "Do not set the `model` field unless the user explicitly asks for a different model."
         ),
         "expected model override usage guidance in spawn_agent description: {description:?}"
     );
@@ -453,7 +453,7 @@ async fn multi_agent_v2_cold_resume_refreshes_legacy_usage_hints_once(
     let mut removed_usage_hint_presence = false;
     let legacy_rollout = std::fs::read_to_string(&rollout_path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .map(|mut line| {

@@ -684,6 +684,8 @@ pub(crate) fn construct_model_info_from_candidates(
             }
         } else {
             remote.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+                persistent_instructions: None,
+                tools: None,
                 instructions_template: Some(model_info::BASE_INSTRUCTIONS.to_string()),
                 instructions_variables: None,
                 approvals: None,
@@ -692,6 +694,7 @@ pub(crate) fn construct_model_info_from_candidates(
                 permissions: None,
                 multi_agent: None,
                 token_budget: None,
+                confirmation_policies: None,
                 guardian_v2: None,
             });
         }
